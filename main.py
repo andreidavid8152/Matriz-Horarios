@@ -64,6 +64,7 @@ for materia in materias_buscadas:
 
 # =============================================================================
 # 3. Definir las horas requeridas por materia (diferenciando Anatom TEO y PRA)
+#    Puedes ajustar estos valores a tus necesidades.
 # =============================================================================
 subject_hours = {
     "D-HIST DEL CONOCIM Y LA PRAC M": 2,
@@ -78,11 +79,11 @@ subject_hours = {
 
 
 # =============================================================================
-# 4. Generar la lista de franjas horarias con el formato solicitado
+# 4. Generar la lista de franjas horarias (slots) con tus reglas
 # =============================================================================
 def generate_time_slots():
     slots = []
-    # Fase 1: Desde 07:00 hasta un cierto umbral (17:50) con bloques de 60 min + 5 min de break
+    # Fase 1: Desde 07:00 hasta ~17:50 con bloques de 60 min + 5 min de break
     start_phase1 = datetime.strptime("07:00", "%H:%M")
     threshold = datetime.strptime("17:50", "%H:%M")
     slot_duration1 = timedelta(minutes=60)
@@ -110,20 +111,19 @@ def generate_time_slots():
 time_slots = generate_time_slots()
 
 # =============================================================================
-# 5. Días de la semana (columnas). Agregamos Sábado
+# 5. Días de la semana (columnas). Incluye Sábado
 # =============================================================================
 days = ["Lunes", "Martes", "Miércoles", "Jueves", "Viernes", "Sábado"]
 
 
 # =============================================================================
-# 6. Función para verificar la disponibilidad de un aula en el DataFrame original
+# 6. Función para verificar la disponibilidad de un aula en la programación real
 # =============================================================================
 def is_aula_available(aula, day, slot_start, slot_end, df_existing):
     """
-    Revisa, según el df de la programación original, si esa aula está
-    disponible en ese día y franja (no se empalme con algo existente).
+    Verifica, en el df de la programación original, si un aula está disponible
+    en un día y franja dada (que no se empalme con otra materia real).
     """
-    # Mapeo de días, incluyendo sábado como día 6
     day_mapping = {
         "Lunes": 1,
         "Martes": 2,
@@ -158,18 +158,42 @@ def is_aula_available(aula, day, slot_start, slot_end, df_existing):
 
 
 # =============================================================================
-# 7. (Opcional) Set de asignaciones usadas si quieres evitar que repitan combos
-#    (Si no quieres evitar repetición, comenta estas líneas)
+# 7. Set global de asignaciones (para evitar colisiones entre distintos horarios)
+#    Guardamos combos sin la materia, así ningún horario futuro reutiliza
+#    (día, slot, aula) ya usado.
 # =============================================================================
-used_assignments = set()
+used_assignments = set()  # (day, slot_start, slot_end, aula)
 
 
 # =============================================================================
-# 8. Función que genera un horario usando un algoritmo "greedy" de asignación
-#    Si falla alguna materia, regresa None (sin warnings).
+# 8. Función para checar si existe un tramo de 5 horas consecutivas ocupadas
+#    en el día (independientemente de la materia).
+# =============================================================================
+def exceeds_4_consecutive_any_subject(schedule_df, day):
+    """
+    Retorna True si en el día dado (columna `day` del DF) se detectan 5 o más
+    franjas consecutivas ocupadas, False en caso contrario.
+    """
+    assigned_series = schedule_df[day] != ""  # True si la celda está ocupada
+    consecutive_count = 0
+
+    for assigned in assigned_series:
+        if assigned:
+            consecutive_count += 1
+            if consecutive_count >= 5:
+                return True
+        else:
+            consecutive_count = 0
+
+    return False
+
+
+# =============================================================================
+# 9. Generar horario (greedy), con tope de 4 horas consecutivas por materia
+#    y además sin permitir 5 horas consecutivas de clase en un día (cualquier materia)
 # =============================================================================
 def generate_schedule():
-    # Crear la estructura vacía del horario
+    # Crear estructura vacía
     index_slots = [f"{s}-{e}" for s, e in time_slots]
     schedule_df = pd.DataFrame(
         index=index_slots, columns=["Hora Inicio", "Hora Fin"] + days
@@ -178,141 +202,186 @@ def generate_schedule():
         schedule_df.loc[schedule_df.index[i], "Hora Inicio"] = s
         schedule_df.loc[schedule_df.index[i], "Hora Fin"] = e
 
-    for day in days:
-        schedule_df[day] = ""
+    for d in days:
+        schedule_df[d] = ""
 
-    # Llevar el conteo de horas asignadas por materia en cada día
+    # Conteo de horas asignadas por materia en cada día (por si quieres mantener tope 4 consecutivas por materia)
     subject_schedule_count = {
         subject: {day: 0 for day in days} for subject in subject_hours.keys()
     }
+    max_consecutive_for_subject = 4  # ajusta si quieres otro tope por materia
 
-    # Algoritmo greedy para asignar bloques (máximo 2 horas consecutivas por día)
     for subject, hours_needed in subject_hours.items():
         candidate_aulas = subject_classrooms.get(subject, [])
 
-        # Mientras esta materia necesite horas
         while hours_needed > 0:
             assigned_in_iteration = False
 
-            # Mezclamos el orden de los días para no asignar siempre en el mismo orden
+            # Orden aleatorio de días para no asignar siempre en el mismo orden
             day_order = days[:]
             random.shuffle(day_order)
 
             for day in day_order:
-                # Si ese sujeto ya tiene 2 horas en este día, pasamos
-                if subject_schedule_count[subject][day] >= 2:
+                # Si ya tiene 4 horas en este día, no dejamos meter más (para este subject)
+                if subject_schedule_count[subject][day] >= max_consecutive_for_subject:
                     continue
 
-                # Tamaño posible del bloque a asignar (máx 2, o lo que falte de la materia)
-                block_size = min(2 - subject_schedule_count[subject][day], hours_needed)
+                # Cuántas horas podría meter hoy sin pasar el tope de 4 para este subject
+                max_today_subject = (
+                    max_consecutive_for_subject - subject_schedule_count[subject][day]
+                )
+                if max_today_subject <= 0:
+                    continue
 
-                # 1) Intentar encontrar un bloque consecutivo de tamaño block_size
-                for i in range(len(time_slots) - block_size + 1):
-                    # Revisamos que todas esas celdas estén libres en la schedule_df
-                    slots_free = True
-                    for j in range(block_size):
-                        row_label = f"{time_slots[i+j][0]}-{time_slots[i+j][1]}"
-                        if schedule_df.at[row_label, day] != "":
-                            slots_free = False
-                            break
-                    if not slots_free:
-                        continue
+                # No metas más horas de las que realmente faltan
+                block_size = min(max_today_subject, hours_needed)
 
-                    # Para cada aula candidata, revisamos disponibilidad
-                    for aula in candidate_aulas:
-                        available_for_all = True
+                # 1) Intentar un bloque consecutivo de 'block_size' (si es > 1)
+                found_block = False
+                if block_size > 1:
+                    for i in range(len(time_slots) - block_size + 1):
+                        # Revisar que todas esas celdas estén libres
+                        all_free = True
                         for j in range(block_size):
-                            slot_start, slot_end = time_slots[i + j]
+                            row_label = f"{time_slots[i+j][0]}-{time_slots[i+j][1]}"
+                            if schedule_df.at[row_label, day] != "":
+                                all_free = False
+                                break
+                        if not all_free:
+                            continue
 
-                            # 1) que el aula esté libre en el DF original
-                            # 2) que la (subject,day,slot,aula) no haya sido usada antes (si usas used_assignments)
-                            combo = (subject, day, slot_start, slot_end, aula)
-                            if (
-                                not is_aula_available(
-                                    aula, day, slot_start, slot_end, df
-                                )
-                            ) or (combo in used_assignments):
-                                available_for_all = False
+                        # Ahora revisamos cada aula candidata
+                        aula_block_ok = None
+                        for aula in candidate_aulas:
+                            available_for_all = True
+                            for j in range(block_size):
+                                slot_start, slot_end = time_slots[i + j]
+                                combo = (day, slot_start, slot_end, aula)
+                                if (combo in used_assignments) or (
+                                    not is_aula_available(
+                                        aula, day, slot_start, slot_end, df
+                                    )
+                                ):
+                                    available_for_all = False
+                                    break
+                            if available_for_all:
+                                aula_block_ok = aula
                                 break
 
-                        if available_for_all:
-                            # Asignamos ese bloque
+                        if aula_block_ok:
+                            # Asignamos tentativamente
+                            assigned_slots = []
                             for j in range(block_size):
                                 slot_start, slot_end = time_slots[i + j]
                                 row_label = f"{slot_start}-{slot_end}"
-                                schedule_df.at[row_label, day] = f"{subject} - {aula}"
-                                used_assignments.add(
-                                    (subject, day, slot_start, slot_end, aula)
+                                schedule_df.at[row_label, day] = (
+                                    f"{subject} - {aula_block_ok}"
                                 )
+                                used_assignments.add(
+                                    (day, slot_start, slot_end, aula_block_ok)
+                                )
+                                assigned_slots.append((row_label, day, aula_block_ok))
 
-                            subject_schedule_count[subject][day] += block_size
-                            hours_needed -= block_size
-                            assigned_in_iteration = True
-                            break  # Salimos del bucle de aulas
-                    if assigned_in_iteration:
-                        break  # Salimos del bucle de slots
+                            # Verificamos si con esto se crearon 5 horas consecutivas
+                            if exceeds_4_consecutive_any_subject(schedule_df, day):
+                                # Revertir asignación
+                                for r_lbl, d_col, a_asig in assigned_slots:
+                                    schedule_df.at[r_lbl, d_col] = ""
+                                    # Quitamos del used_assignments
+                                    slot_start_str, slot_end_str = r_lbl.split("-")
+                                    used_assignments.discard(
+                                        (d_col, slot_start_str, slot_end_str, a_asig)
+                                    )
+                                # No asignamos este bloque
+                                continue
+                            else:
+                                # Asignación válida
+                                subject_schedule_count[subject][day] += block_size
+                                hours_needed -= block_size
+                                found_block = True
+                                assigned_in_iteration = True
+                                break  # rompemos bucle de franjas
 
-                # 2) Si no se encontró un bloque consecutivo y no asignamos nada aún:
-                if (not assigned_in_iteration) and (
-                    subject_schedule_count[subject][day] < 2
-                ):
-                    # Intentar asignaciones individuales
+                        if found_block:
+                            break
+
+                # 2) Si no se encontró un bloque mayor y block_size >= 1 => probamos 1 hora
+                if not found_block and block_size >= 1:
                     for i in range(len(time_slots)):
                         row_label = f"{time_slots[i][0]}-{time_slots[i][1]}"
                         if schedule_df.at[row_label, day] == "":
                             slot_start, slot_end = time_slots[i]
+                            # Probar cada aula
+                            aula_ok = None
                             for aula in candidate_aulas:
-                                combo = (subject, day, slot_start, slot_end, aula)
-                                if is_aula_available(
+                                combo = (day, slot_start, slot_end, aula)
+                                if (
+                                    combo not in used_assignments
+                                ) and is_aula_available(
                                     aula, day, slot_start, slot_end, df
-                                ) and (combo not in used_assignments):
+                                ):
+                                    # Asignar tentativo
                                     schedule_df.at[row_label, day] = (
                                         f"{subject} - {aula}"
                                     )
                                     used_assignments.add(combo)
-
+                                    aula_ok = aula
+                                    break
+                            if aula_ok:
+                                # Revisamos si hay 5 seguidas
+                                if exceeds_4_consecutive_any_subject(schedule_df, day):
+                                    # revertir
+                                    schedule_df.at[row_label, day] = ""
+                                    used_assignments.discard(
+                                        (day, slot_start, slot_end, aula_ok)
+                                    )
+                                    aula_ok = None
+                                    # y seguimos buscando otro slot
+                                else:
+                                    # Perfecto
                                     subject_schedule_count[subject][day] += 1
                                     hours_needed -= 1
                                     assigned_in_iteration = True
+                                    # No asignamos más horas sueltas en este día (rompemos)
                                     break
-                        if assigned_in_iteration or hours_needed <= 0:
-                            break
+                    # fin del for de slots
+                # fin if not found_block
 
                 if assigned_in_iteration or hours_needed <= 0:
-                    break  # Salimos del bucle de días
+                    break  # terminamos con este día o materia
 
             if not assigned_in_iteration:
-                # No hubo forma de asignar ni un bloque ni una hora suelta en ningún día
-                # => retornamos None en lugar de imprimir warning
+                # No hubo forma de asignar nada en esta iteración => fallamos
                 return None
 
-    # Si asignamos todo sin problemas, regresamos el dataframe
     return schedule_df
 
 
 # =============================================================================
-# 9. Generar 20 horarios. Si algún horario sale None, paramos (ya no hay sentido).
+# 10. Generar 20 horarios. Si alguno sale None, paramos.
 # =============================================================================
 unique_schedules = []
-num_schedules_required = 20
+num_schedules_required = 5
 
 for i in range(num_schedules_required):
     sched = generate_schedule()
     if sched is None:
         print(
-            "No se pudo asignar una de las materias; se aborta la generación de más horarios."
+            "No se pudo asignar alguna materia; se aborta la generación de más horarios."
         )
         break
     unique_schedules.append(sched)
     print(f"Horario {len(unique_schedules)} generado.")
 
 if len(unique_schedules) < num_schedules_required:
-    print("No se alcanzaron los 20 horarios por falta de disponibilidad de aulas.")
+    print(
+        "No se alcanzaron los 20 horarios por falta de disponibilidad o restricciones."
+    )
 else:
     print("¡Se generaron 20 horarios exitosamente!")
 
 # =============================================================================
-# 10. Exportar todos los horarios a un archivo Excel, cada uno en una hoja distinta
+# 11. Exportar todos los horarios a un archivo Excel
 # =============================================================================
 if len(unique_schedules) > 0:
     output_file = "Horarios_Unicos.xlsx"
